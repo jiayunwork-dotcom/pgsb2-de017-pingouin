@@ -1,8 +1,10 @@
 from unittest import TestCase
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import t
 
 from pingouin import read_dataset
 from pingouin.pairwise import (
@@ -12,6 +14,43 @@ from pingouin.pairwise import (
     pairwise_ttests,
     pairwise_tukey,
 )
+
+REL = 1e-9
+
+
+def _mixed_reference(d, dv, within, between, subject):
+    """Independent reference quantities for the split-plot (mixed design) interaction.
+
+    Returns the wide-format table, the long-format data, the number of within levels, the
+    between-subject error mean square on the subject-mean scale (MS_b), the within-subject error
+    mean square (MS_w) and the two error degrees of freedom. The mean squares are derived
+    directly from one-way ANOVAs on the subject means and on the subject x condition residuals,
+    without reusing the code of mixed_anova.
+    """
+    piv = d.pivot_table(index=[subject, between], columns=within, values=dv).dropna()
+    k = piv.shape[1]
+    long = piv.melt(ignore_index=False, value_name=dv).reset_index()
+    n_subj = piv.shape[0]
+    n_groups = piv.index.get_level_values(between).nunique()
+    df_b, df_w = n_subj - n_groups, (k - 1) * (n_subj - n_groups)
+
+    # MS_w: pooled subject x condition residual SS within each group
+    ss_w = 0.0
+    for _, sub in piv.groupby(level=between, observed=True):
+        x = sub.to_numpy(float)
+        ss_w += (
+            (x - x.mean(1, keepdims=True) - x.mean(0, keepdims=True) + x.mean()) ** 2
+        ).sum()
+    ms_w = ss_w / df_w
+
+    # MS_b: error mean square of the one-way between-subject ANOVA on the subject means
+    means = piv.mean(axis=1)
+    g_means = means.groupby(level=between, observed=True).mean()
+    g_counts = means.groupby(level=between, observed=True).count()
+    ss_total = ((means - means.mean()) ** 2).sum()
+    ss_between = (g_counts * (g_means - means.mean()) ** 2).sum()
+    ms_b = (ss_total - ss_between) / df_b
+    return piv, long, k, ms_b, ms_w, df_b, df_w
 
 
 class TestPairwise(TestCase):
@@ -819,3 +858,390 @@ class TestPairwise(TestCase):
             )["n"].nunique()
             == 2
         )
+
+
+class TestPairwisePooled(TestCase):
+    """Test the pooled error term option (pooled=True) of pairwise_tests."""
+
+    def test_pooled_simple_between(self):
+        """One between-subject factor: ANOVA Within error term, N-k dof, T == pairwise_tukey."""
+        df = read_dataset("mixed_anova.csv")
+        pt = pairwise_tests(dv="Scores", between="Group", data=df, pooled=True)
+        tukey = pairwise_tukey(data=df, dv="Scores", between="Group")
+        aov = df.anova(dv="Scores", between="Group", detailed=True)
+        # Output structure: se column, no BF10
+        assert "se" in pt.columns and "BF10" not in pt.columns
+        # Degrees of freedom = N - k = ANOVA Within DF
+        assert pt["dof"].nunique() == 1
+        assert pt["dof"].iloc[0] == aov.loc[aov.Source == "Within", "DF"].iloc[0]
+        # T and se match Tukey-Kramer
+        np.testing.assert_allclose(pt["T"], tukey["T"], rtol=REL)
+        np.testing.assert_allclose(pt["se"], tukey["se"], rtol=REL)
+        # T = diff / se and p-value from the T distribution
+        np.testing.assert_allclose(pt["T"], (pt["T"] * pt["se"]) / pt["se"])
+        p_ref = 2 * t.sf(np.abs(pt["T"]), pt["dof"])
+        np.testing.assert_allclose(pt["p_unc"], p_ref, rtol=REL)
+
+        # Three groups (unbalanced): every pair matches Tukey, dof = N - k
+        dfa = read_dataset("anova")
+        pt = pairwise_tests(data=dfa, dv="Pain threshold", between="Hair color", pooled=True)
+        tukey = pairwise_tukey(data=dfa, dv="Pain threshold", between="Hair color")
+        aov = dfa.anova(dv="Pain threshold", between="Hair color", detailed=True)
+        np.testing.assert_allclose(pt["T"], tukey["T"], rtol=REL)
+        assert pt["dof"].iloc[0] == aov.loc[aov.Source == "Within", "DF"].iloc[0]
+        assert pt.shape[0] == 6  # 4 groups -> 6 pairs
+
+    def test_pooled_multiple_between_balanced(self):
+        """Two between factors (balanced): factorial residual, EMM main effects, Tukey T."""
+        df = read_dataset("anova2")
+        f1, f2 = "Blend", "Crop"
+        pt = pairwise_tests(data=df, dv="Yield", between=[f1, f2], pooled=True)
+        aov = df.anova(dv="Yield", between=[f1, f2], ss_type=3)
+        n_cells = df[f1].nunique() * df[f2].nunique()
+
+        # dof = N - number of cells on every row
+        assert pt["dof"].nunique() == 1
+        assert pt["dof"].iloc[0] == df["Yield"].size - n_cells
+
+        # Main effect of a two-level factor: T^2 == F and p == F-test p
+        main = pt[pt.Contrast == f1].iloc[0]
+        f_row = aov[aov.Source == f1].iloc[0]
+        np.testing.assert_allclose(main["T"] ** 2, f_row["F"], rtol=REL)
+        np.testing.assert_allclose(main["p_unc"], f_row["p_unc"], rtol=REL)
+
+        # Interaction T-values match pairwise_tukey on the cells
+        tukey = pairwise_tukey(data=df, dv="Yield", between=[f1, f2])
+        t_map = {(a, b): val for a, b, val in zip(tukey["A"], tukey["B"], tukey["T"])}
+        inter = pt[pt.Contrast == f"{f1} * {f2}"].reset_index(drop=True)
+        for _, row in inter.iterrows():
+            ref = t_map[((row[f1], row["A"]), (row[f1], row["B"]))]
+            np.testing.assert_allclose(row["T"], ref, rtol=REL)
+
+        # Main-effect rows compare estimated marginal means (equal-weight cell-mean averages)
+        desc = pairwise_tests(
+            data=df, dv="Yield", between=[f1, f2], pooled=True, return_desc=True
+        )
+        cell_means = df.groupby([f1, f2], observed=True)["Yield"].mean()
+        for fac, other in ((f1, f2), (f2, f1)):
+            emm = cell_means.groupby(level=fac, observed=True).mean()
+            for _, row in desc[desc.Contrast == fac].iterrows():
+                np.testing.assert_allclose(row["mean_A"], emm[row["A"]], rtol=REL)
+                np.testing.assert_allclose(row["mean_B"], emm[row["B"]], rtol=REL)
+                np.testing.assert_allclose(row["T"], (row["mean_A"] - row["mean_B"]) / row["se"])
+
+    def test_pooled_multiple_between_unbalanced(self):
+        """Two between factors (unbalanced): same identities with statsmodels type III SS."""
+        df = read_dataset("anova2_unbalanced")
+        f1, f2 = "Diet", "Exercise"
+        pt = pairwise_tests(data=df, dv="Scores", between=[f1, f2], pooled=True)
+        aov = df.anova(dv="Scores", between=[f1, f2], ss_type=3)
+        n_cells = df[f1].nunique() * df[f2].nunique()
+        assert pt["dof"].iloc[0] == df["Scores"].size - n_cells
+        # Both factors have two levels: T^2 == F and p == F p on each main effect
+        for fac in (f1, f2):
+            row = pt[pt.Contrast == fac].iloc[0]
+            f_row = aov[aov.Source == fac].iloc[0]
+            np.testing.assert_allclose(row["T"] ** 2, f_row["F"], rtol=REL)
+            np.testing.assert_allclose(row["p_unc"], f_row["p_unc"], rtol=REL)
+        # Interaction T-values match Tukey on the cells
+        tukey = pairwise_tukey(data=df, dv="Scores", between=[f1, f2])
+        t_map = {(a, b): val for a, b, val in zip(tukey["A"], tukey["B"], tukey["T"])}
+        inter = pt[pt.Contrast == f"{f1} * {f2}"].reset_index(drop=True)
+        for _, row in inter.iterrows():
+            ref = t_map[((row[f1], row["A"]), (row[f1], row["B"]))]
+            np.testing.assert_allclose(row["T"], ref, rtol=REL)
+
+    def test_pooled_multiple_between_empty_cells(self):
+        """An empty between-subject cell raises a ValueError."""
+        df = read_dataset("anova2")
+        df = df[~((df["Blend"] == "Blend X") & (df["Crop"] == "Corn"))]
+        with pytest.raises(ValueError):
+            pairwise_tests(data=df, dv="Yield", between=["Blend", "Crop"], pooled=True)
+
+    def test_pooled_simple_within(self):
+        """One within factor: subject x condition error, (n-1)(k-1) dof, 2-level == paired t."""
+        df = read_dataset("mixed_anova.csv")
+        n, k = df["Subject"].nunique(), df["Time"].nunique()
+        pt = pairwise_tests(dv="Scores", within="Time", subject="Subject", data=df, pooled=True)
+        aov = df.rm_anova(dv="Scores", within="Time", subject="Subject")
+        assert "se" in pt.columns and "BF10" not in pt.columns
+        assert pt["dof"].nunique() == 1
+        assert pt["dof"].iloc[0] == (n - 1) * (k - 1)
+        assert pt["dof"].iloc[0] == aov["ddof2"].iloc[0]
+        # T = difference of the condition means / se
+        means = df.groupby("Time", observed=True)["Scores"].mean()
+        for _, row in pt.iterrows():
+            np.testing.assert_allclose(row["T"], (means[row["A"]] - means[row["B"]]) / row["se"])
+
+        # With two levels, T and p are identical to the regular paired T-test, and T^2 == F
+        df2 = df[df["Time"].isin(["August", "June"])]
+        pooled = pairwise_tests(
+            dv="Scores", within="Time", subject="Subject", data=df2, pooled=True
+        )
+        regular = pairwise_tests(dv="Scores", within="Time", subject="Subject", data=df2)
+        np.testing.assert_allclose(pooled["T"], regular["T"], rtol=REL)
+        np.testing.assert_allclose(pooled["p_unc"], regular["p_unc"], rtol=REL)
+        aov2 = df2.rm_anova(dv="Scores", within="Time", subject="Subject")
+        np.testing.assert_allclose(pooled["T"].iloc[0] ** 2, aov2["F"].iloc[0], rtol=REL)
+
+    def test_pooled_mixed_balanced(self):
+        """Mixed design, balanced data, both interaction orders."""
+        df = read_dataset("mixed_anova.csv")
+        aov = df.mixed_anova(dv="Scores", within="Time", between="Group", subject="Subject")
+        f_group = aov.loc[aov.Source == "Group", "F"].iloc[0]
+        df_group = aov.loc[aov.Source == "Group", "DF2"].iloc[0]
+        df_time = aov.loc[aov.Source == "Time", "DF2"].iloc[0]
+        for within_first in (True, False):
+            pt = pairwise_tests(
+                dv="Scores", within="Time", between="Group", subject="Subject", data=df,
+                pooled=True, within_first=within_first,
+            )
+            # Within main effect: within-subject error term and its DF2
+            w_rows = pt[pt.Contrast == "Time"]
+            assert w_rows["dof"].nunique() == 1
+            assert w_rows["dof"].iloc[0] == df_time
+            # Between main effect: between-subject error term and its DF2, T^2 == F (2 groups)
+            b_row = pt[pt.Contrast == "Group"].iloc[0]
+            assert b_row["dof"] == df_group
+            np.testing.assert_allclose(b_row["T"] ** 2, f_group, rtol=REL)
+            np.testing.assert_allclose(
+                b_row["p_unc"], aov.loc[aov.Source == "Group", "p_unc"].iloc[0], rtol=REL
+            )
+            # Interaction rows use the within-subject error dof in both orders
+            contrast = "Time * Group" if within_first else "Group * Time"
+            i_rows = pt[pt.Contrast == contrast]
+            assert i_rows["Paired"].iloc[0] == (not within_first)
+            if not within_first:
+                assert (i_rows["dof"] == df_time).all()
+
+        # Two within levels: within main effect T^2 == F of the mixed ANOVA
+        df2 = df[df["Time"].isin(["August", "June"])]
+        aov2 = df2.mixed_anova(dv="Scores", within="Time", between="Group", subject="Subject")
+        pt2 = pairwise_tests(
+            dv="Scores", within="Time", between="Group", subject="Subject",
+            data=df2, pooled=True,
+        )
+        w_row = pt2[pt2.Contrast == "Time"].iloc[0]
+        np.testing.assert_allclose(
+            w_row["T"] ** 2, aov2.loc[aov2.Source == "Time", "F"].iloc[0], rtol=REL
+        )
+        np.testing.assert_allclose(
+            w_row["p_unc"], aov2.loc[aov2.Source == "Time", "p_unc"].iloc[0], rtol=REL
+        )
+
+    def test_pooled_mixed_unbalanced_and_ws_reference(self):
+        """Unbalanced mixed design and independent Welch-Satterthwaite reference."""
+        df = read_dataset("mixed_anova_unbalanced")
+        aov = df.mixed_anova(dv="Scores", within="Time", between="Group", subject="Subject")
+        piv, long, k, ms_b, ms_w, df_b, df_w = _mixed_reference(
+            df, "Scores", "Time", "Group", "Subject"
+        )
+        # Reference mean squares match the mixed_anova error terms (MS_b is on the subject-mean
+        # scale, i.e. the ANOVA between-error MS divided by k)
+        gm = long["Scores"].mean()
+        g_b = long.groupby("Group", observed=True)["Scores"]
+        g_w = long.groupby("Time", observed=True)["Scores"]
+        ss_b = ((g_b.mean() - gm) ** 2 * g_b.count()).sum()
+        ss_w = ((g_w.mean() - gm) ** 2 * g_w.count()).sum()
+        g_both = long.groupby(["Group", "Time"], observed=True)["Scores"]
+        ss_resall = ((long["Scores"] - g_both.transform("mean")) ** 2).sum()
+        ss_total = ((long["Scores"] - gm) ** 2).sum()
+        ss_inter = ss_total - (ss_resall + ss_w + ss_b)
+        ss_subj = k * ((piv.mean(axis=1) - gm) ** 2).sum()
+        np.testing.assert_allclose(k * ms_b, (ss_subj - ss_b) / df_b, rtol=REL)
+        np.testing.assert_allclose(
+            ms_w, (ss_total - (ss_w + ss_subj + ss_inter)) / df_w, rtol=REL
+        )
+
+        pt = pairwise_tests(
+            dv="Scores", within="Time", between="Group", subject="Subject", data=df,
+            pooled=True, within_first=True,
+        )
+        # Main-effect degrees of freedom match the mixed ANOVA DF2
+        assert pt[pt.Contrast == "Time"]["dof"].iloc[0] == aov.loc[
+            aov.Source == "Time", "DF2"].iloc[0]
+        assert pt[pt.Contrast == "Group"]["dof"].iloc[0] == aov.loc[
+            aov.Source == "Group", "DF2"].iloc[0]
+
+        # Interaction: se, dof, T and p checked against the independently derived reference on
+        # every row. The WS dof is non-integer on this unbalanced design.
+        cell = long.groupby(["Group", "Time"], observed=True)["Scores"]
+        cell_mean, cell_n = cell.mean(), cell.count()
+        inter = pt[pt.Contrast == "Time * Group"].reset_index(drop=True)
+        assert not inter["dof"].apply(float.is_integer).all()
+        for _, row in inter.iterrows():
+            tlevel, a, b = row["Time"], row["A"], row["B"]
+            na = cell_n.xs(tlevel, level="Time")[a]
+            nb = cell_n.xs(tlevel, level="Time")[b]
+            c1 = 1 / na + 1 / nb
+            c2 = (k - 1) / k * c1
+            v = c1 * ms_b + c2 * ms_w
+            se_ref = np.sqrt(v)
+            dof_ref = v**2 / ((c1 * ms_b) ** 2 / df_b + (c2 * ms_w) ** 2 / df_w)
+            diff = cell_mean.xs(tlevel, level="Time")[a] - cell_mean.xs(
+                tlevel, level="Time")[b]
+            t_ref = diff / se_ref
+            p_ref = 2 * t.sf(np.abs(t_ref), dof_ref)
+            np.testing.assert_allclose(row["se"], se_ref, rtol=REL)
+            np.testing.assert_allclose(row["dof"], dof_ref, rtol=REL)
+            np.testing.assert_allclose(row["T"], t_ref, rtol=REL)
+            np.testing.assert_allclose(row["p_unc"], p_ref, rtol=REL)
+
+        # within_first=False: within each group the within-factor levels are compared with the
+        # within-subject error term: se = sqrt(2 * MS_w / n_g) and the mixed ANOVA DF2.
+        pt0 = pairwise_tests(
+            dv="Scores", within="Time", between="Group", subject="Subject", data=df,
+            pooled=True, within_first=False,
+        )
+        i0 = pt0[pt0.Contrast == "Group * Time"]
+        assert (i0["dof"] == aov.loc[aov.Source == "Time", "DF2"].iloc[0]).all()
+        assert i0["Paired"].all()
+        for _, row in i0.iterrows():
+            n_g = (piv.index.get_level_values("Group") == row["Group"]).sum()
+            np.testing.assert_allclose(row["se"], np.sqrt(2 * ms_w / n_g), rtol=REL)
+
+    def test_pooled_alternative_and_padjust(self):
+        """One-sided semantics and family-wise p-adjustment are preserved."""
+        df = read_dataset("mixed_anova.csv")
+        two = pairwise_tests(dv="Scores", between="Group", data=df, pooled=True)
+        greater = pairwise_tests(
+            dv="Scores", between="Group", data=df, pooled=True, alternative="greater"
+        )
+        less = pairwise_tests(
+            dv="Scores", between="Group", data=df, pooled=True, alternative="less"
+        )
+        tval, dof = two["T"].iloc[0], two["dof"].iloc[0]
+        np.testing.assert_allclose(greater["p_unc"].iloc[0], t.sf(tval, dof), rtol=REL)
+        np.testing.assert_allclose(less["p_unc"].iloc[0], t.cdf(tval, dof), rtol=REL)
+        np.testing.assert_allclose(two["p_unc"].iloc[0], 2 * t.sf(abs(tval), dof), rtol=REL)
+
+        # Family grouping: Time (3 rows) and the interaction (3 rows) corrected separately,
+        # the single Group row is not part of a multi-test family.
+        pt = pairwise_tests(
+            dv="Scores", within="Time", between="Group", subject="Subject", data=df,
+            pooled=True, padjust="bonf",
+        )
+        for contrast in ("Time", "Time * Group"):
+            fam = pt[pt.Contrast == contrast]
+            np.testing.assert_allclose(
+                fam["p_corr"], np.clip(fam["p_unc"] * fam.shape[0], 0, 1), rtol=REL
+            )
+            assert (fam["p_adjust"] == "bonf").all()
+        grp = pt[pt.Contrast == "Group"]
+        assert "p_corr" not in grp.columns or grp["p_corr"].isna().all()
+
+        # correction has no effect on the pooled tests
+        default = pairwise_tests(dv="Scores", between="Group", data=df, pooled=True)
+        corrected = pairwise_tests(
+            dv="Scores", between="Group", data=df, pooled=True, correction=True
+        )
+        pd.testing.assert_frame_equal(default, corrected)
+
+    def test_pooled_return_desc_and_effect_size(self):
+        """return_desc reports the compared estimates; effect sizes match the non-pooled tests."""
+        df = read_dataset("mixed_anova.csv")
+        # Simple within: means are the condition means
+        pt = pairwise_tests(
+            dv="Scores", within="Time", subject="Subject", data=df,
+            pooled=True, return_desc=True,
+        )
+        means = df.groupby("Time", observed=True)["Scores"].mean()
+        stds = df.groupby("Time", observed=True)["Scores"].std()
+        for _, row in pt.iterrows():
+            np.testing.assert_allclose(row["mean_A"], means[row["A"]], rtol=REL)
+            np.testing.assert_allclose(row["mean_B"], means[row["B"]], rtol=REL)
+            np.testing.assert_allclose(row["std_A"], stds[row["A"]])
+            np.testing.assert_allclose(row["std_B"], stds[row["B"]])
+
+        # Effect sizes are identical to the non-pooled pairwise tests
+        for effsize in ("hedges", "cohen"):
+            for kwargs in (
+                dict(between="Group"),
+                dict(within="Time", subject="Subject"),
+                dict(within="Time", between="Group", subject="Subject"),
+            ):
+                regular = pairwise_tests(data=df, dv="Scores", effsize=effsize, **kwargs)
+                pooled = pairwise_tests(
+                    data=df, dv="Scores", effsize=effsize, pooled=True, **kwargs
+                )
+                np.testing.assert_allclose(regular[effsize], pooled[effsize], rtol=REL)
+
+    def test_pooled_missing_values(self):
+        """Listwise deletion still applies and dof match the repeated-measures ANOVA."""
+        df = read_dataset("pairwise_tests_missing")
+        st = pairwise_tests(
+            dv="Value", within="Condition", subject="Subject", data=df, pooled=True
+        )
+        aov = df.rm_anova(dv="Value", within="Condition", subject="Subject", detailed=True)
+        assert (st["dof"] == aov.loc[aov.Source == "Error", "DF"].iloc[0]).all()
+        assert "se" in st.columns and "BF10" not in st.columns
+
+    def test_pooled_errors(self):
+        """All unsupported argument combinations raise a ValueError."""
+        df = read_dataset("mixed_anova.csv")
+        df_rm2 = read_dataset("rm_anova2")
+        # pooled must be a strict boolean
+        for bad in (0, 1, "True", None):
+            with pytest.raises(ValueError):
+                pairwise_tests(dv="Scores", between="Group", data=df, pooled=bad)
+        # Only parametric tests
+        with pytest.raises(ValueError):
+            pairwise_tests(
+                dv="Scores", between="Group", data=df, pooled=True, parametric=False
+            )
+        # Pairwise deletion of missing values
+        with pytest.raises(ValueError):
+            pairwise_tests(
+                dv="Scores", within="Time", subject="Subject", data=df,
+                pooled=True, nan_policy="pairwise",
+            )
+        # Two within-subject factors
+        with pytest.raises(ValueError):
+            pairwise_tests(
+                dv="Performance", within=["Time", "Metric"], subject="Subject",
+                data=df_rm2, pooled=True,
+            )
+        # marginal=False in a mixed design
+        with pytest.raises(ValueError):
+            pairwise_tests(
+                dv="Scores", within="Time", between="Group", subject="Subject",
+                data=df, pooled=True, marginal=False,
+            )
+        # Empty cells with two between-subject factors is covered in its own test
+
+    def test_pooled_false_regression(self):
+        """pooled=False (default) leaves the output bitwise identical to the old behavior."""
+        df = read_dataset("mixed_anova.csv")
+        for kwargs in (
+            dict(between="Group"),
+            dict(within="Time", subject="Subject"),
+            dict(within="Time", between="Group", subject="Subject"),
+            dict(between=["Group", "Time"]),
+        ):
+            default = pairwise_tests(data=df, dv="Scores", **kwargs)
+            explicit = pairwise_tests(data=df, dv="Scores", pooled=False, **kwargs)
+            pd.testing.assert_frame_equal(default, explicit)
+            assert "se" not in default.columns
+            assert "BF10" in default.columns
+        # Shuffled rows give the same result
+        shuffled = pairwise_tests(
+            data=df.sample(frac=1), dv="Scores", within="Time", subject="Subject", pooled=False
+        )
+        regular = pairwise_tests(
+            data=df, dv="Scores", within="Time", subject="Subject", pooled=False
+        )
+        pd.testing.assert_frame_equal(shuffled, regular)
+
+    def test_pooled_interaction_flag(self):
+        """interaction=False removes the interaction family only."""
+        df = read_dataset("mixed_anova.csv")
+        pt = pairwise_tests(
+            dv="Scores", within="Time", between="Group", subject="Subject", data=df,
+            pooled=True, interaction=False,
+        )
+        assert set(pt["Contrast"]) == {"Time", "Group"}
+        pt2 = pairwise_tests(
+            data=read_dataset("anova2"), dv="Yield", between=["Blend", "Crop"],
+            pooled=True, interaction=False,
+        )
+        assert set(pt2["Contrast"]) == {"Blend", "Crop"}

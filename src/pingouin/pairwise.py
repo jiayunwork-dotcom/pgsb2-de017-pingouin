@@ -6,7 +6,7 @@ from itertools import combinations, product
 import numpy as np
 import pandas as pd
 import pandas_flavor as pf
-from scipy.stats import studentized_range
+from scipy.stats import studentized_range, t
 
 from .config import _no_rounding
 from .effsize import compute_effsize
@@ -85,6 +85,401 @@ def _group_arrays(data, by, dv):
     return {k: v.to_numpy(dtype=np.float64) for k, v in grp}
 
 
+def _t_pvalue(tval, dof, alternative):
+    """P-value of a T statistic with ``dof`` degrees of freedom, for the given tail."""
+    if alternative == "greater":
+        return t.sf(tval, dof)
+    elif alternative == "less":
+        return t.cdf(tval, dof)
+    return 2 * t.sf(np.abs(tval), dof)
+
+
+def _pooled_row(diff, se, dof, alternative, paired, x, y, effsize, desc=None):
+    """Build one output row of a pooled pairwise test from an estimated contrast and its SE.
+
+    The T statistic is the estimated difference divided by the pooled standard error, and the
+    p-value uses the (possibly non-integer) pooled degrees of freedom. The effect size is still
+    computed pairwise from the raw observations, exactly as in :py:func:`pairwise_tests`.
+    ``desc`` optionally provides the (mean_A, std_A, mean_B, std_B) descriptive statistics.
+    """
+    tval = diff / se
+    row = {
+        "alternative": alternative,
+        "T": tval,
+        "dof": float(dof),
+        "se": se,
+        "p_unc": _t_pvalue(tval, dof, alternative),
+        effsize: compute_effsize(x=x, y=y, eftype=effsize, paired=paired),
+    }
+    if desc is not None:
+        row.update(zip(("mean_A", "std_A", "mean_B", "std_B"), desc))
+    return row
+
+
+def _cell_stats(data, dv, factors):
+    """Per-cell mean, sample size and variance of a factorial between-subject design."""
+    grp = data.groupby(factors, observed=True, sort=True)[dv]
+    return grp.mean(), grp.count(), grp.var(numeric_only=True)
+
+
+def _pooled_simple_between(data, dv, factor, effsize, alternative, return_desc):
+    """Pooled comparisons for a single between-subject factor.
+
+    The error term is the Within mean square of the one-way ANOVA
+    (:py:func:`pingouin.anova`), with ``N - k`` degrees of freedom, and the standard errors are
+    the Tukey-Kramer standard errors, so the T-values match :py:func:`pingouin.pairwise_tukey`.
+    """
+    grp = data.groupby(factor, observed=True, sort=True)[dv]
+    means, n, gvars = grp.mean(numeric_only=True), grp.count(), grp.var(numeric_only=True)
+    dof = n.sum() - len(n)
+    mse = np.nansum((n - 1) * gvars) / dof
+    groups = _group_arrays(data, factor, dv)
+    rows = []
+    for a, b in combinations(means.index, 2):
+        se = np.sqrt(mse * (1 / n[a] + 1 / n[b]))
+        desc = (
+            (means[a], np.nanstd(groups[a], ddof=1), means[b], np.nanstd(groups[b], ddof=1))
+            if return_desc
+            else None
+        )
+        row = {"Contrast": factor, "A": a, "B": b, "Paired": False}
+        row.update(
+            _pooled_row(
+                means[a] - means[b], se, dof, alternative, False, groups[a], groups[b],
+                effsize, desc,
+            )
+        )
+        rows.append(row)
+    return rows
+
+
+def _pooled_multiple_between(data, dv, factors, effsize, alternative, return_desc):
+    """Pooled comparisons for two between-subject factors.
+
+    The error term is the residual mean square of the full factorial model (with the
+    interaction), whose degrees of freedom are the total sample size minus the number of cells.
+    Main-effect contrasts compare estimated marginal means, i.e. unweighted averages of the cell
+    means across the levels of the other factor. Interaction contrasts compare cell means within
+    each level of the first factor, and use the same standard errors (and therefore T-values) as
+    :py:func:`pingouin.pairwise_tukey`.
+    """
+    f1, f2 = factors
+    data = data[[dv, f1, f2]].dropna()
+    n_cells = data[f1].nunique() * data[f2].nunique()
+    if data.groupby([f1, f2], observed=True).ngroups < n_cells:
+        raise ValueError(
+            "Each combination of the between-subject factors must have at least one "
+            "observation. Pooled pairwise tests cannot be estimated with empty cells."
+        )
+    cell_mean, cell_n, cell_var = _cell_stats(data, dv, [f1, f2])
+    dof = cell_n.sum() - len(cell_n)
+    mse = np.nansum((cell_n - 1) * cell_var) / dof
+    raw_groups = _group_arrays(data, [f1, f2], dv)
+    rows = []
+    # Main effects: estimated marginal means (equal-weight average of the cell means)
+    for fac, other in ((f1, f2), (f2, f1)):
+        n_other = data[other].nunique()
+        emm = cell_mean.groupby(level=fac, observed=True, sort=True).mean()
+        levels = list(emm.index)
+        for a, b in combinations(levels, 2):
+            n_a = cell_n.xs(a, level=fac)
+            n_b = cell_n.xs(b, level=fac)
+            # Variance of each EMM: variance of the average of the cell means across the levels
+            # of the other factor, weighting each cell by its own sample size.
+            se = np.sqrt(
+                (mse / n_a).sum() / n_other**2 + (mse / n_b).sum() / n_other**2
+            )
+            # Effect size and (optionally) standard deviations use the raw observations of the
+            # marginal groups, while the means are the estimated marginal means.
+            x = data.loc[data[fac] == a, dv].to_numpy(dtype=np.float64)
+            y = data.loc[data[fac] == b, dv].to_numpy(dtype=np.float64)
+            desc = (
+                (emm[a], np.nanstd(x, ddof=1), emm[b], np.nanstd(y, ddof=1))
+                if return_desc
+                else None
+            )
+            row = {"Contrast": fac, "A": a, "B": b, "Paired": False}
+            row.update(
+                _pooled_row(emm[a] - emm[b], se, dof, alternative, False, x, y, effsize, desc)
+            )
+            rows.append(row)
+    # Interaction: cell means compared within each level of the first factor
+    for fac1 in cell_mean.index.get_level_values(f1).unique():
+        means = cell_mean.xs(fac1, level=f1)
+        ns = cell_n.xs(fac1, level=f1)
+        for a, b in combinations(means.index, 2):
+            se = np.sqrt(mse * (1 / ns[a] + 1 / ns[b]))
+            x, y = raw_groups[(fac1, a)], raw_groups[(fac1, b)]
+            desc = (
+                (means[a], np.nanstd(x, ddof=1), means[b], np.nanstd(y, ddof=1))
+                if return_desc
+                else None
+            )
+            row = {
+                "Contrast": f"{f1} * {f2}",
+                "Time": fac1,
+                "A": a,
+                "B": b,
+                "Paired": False,
+            }
+            row.update(
+                _pooled_row(means[a] - means[b], se, dof, alternative, False, x, y, effsize, desc)
+            )
+            rows.append(row)
+    return rows
+
+
+def _pooled_simple_within(data_piv, dv, within, effsize, alternative, return_desc):
+    """Pooled comparisons for a single within-subject factor.
+
+    The error term is the subject x condition interaction mean square of the one-way repeated
+    measures ANOVA (:py:func:`pingouin.rm_anova`), with ``(n - 1)(k - 1)`` degrees of freedom.
+    With only two levels the pooled T statistic and p-value are identical to the paired T-test.
+    """
+    n, k = data_piv.shape
+    dof = (n - 1) * (k - 1)
+    vals = data_piv.to_numpy(dtype=np.float64)
+    cond_means = data_piv.mean(axis=0)
+    subj_means = data_piv.mean(axis=1)
+    grandmean = vals.mean()
+    # SS of the subject x condition interaction (= residual of the repeated measures ANOVA)
+    residual = (
+        vals - subj_means.to_numpy()[:, None] - cond_means.to_numpy()[None, :] + grandmean
+    )
+    ss_error = (residual**2).sum()
+    mse = ss_error / dof
+    long = data_piv.stack(future_stack=True).rename(dv).reset_index()
+    groups = _group_arrays(long, within, dv)
+    rows = []
+    for a, b in combinations(data_piv.columns, 2):
+        x, y = groups[a], groups[b]
+        se = np.sqrt(2 * mse / n)
+        desc = (
+            (cond_means[a], np.nanstd(x, ddof=1), cond_means[b], np.nanstd(y, ddof=1))
+            if return_desc
+            else None
+        )
+        row = {"Contrast": within, "A": a, "B": b, "Paired": True}
+        row.update(
+            _pooled_row(
+                cond_means[a] - cond_means[b], se, dof, alternative, True, x, y, effsize, desc
+            )
+        )
+        rows.append(row)
+    return rows
+
+
+def _mixed_error_terms(data_piv, long, dv, within, between):
+    """Between- and within-subject error mean squares and degrees of freedom of a mixed ANOVA.
+
+    This replicates the split-plot sums of squares computed by :py:func:`pingouin.mixed_anova`.
+    """
+    n_rm = data_piv.shape[1]
+    n_subj = data_piv.shape[0]
+    n_groups = long[between].nunique()
+    grandmean = long[dv].mean(numeric_only=True)
+    grp_b = long.groupby(between, observed=True)[dv]
+    grp_w = long.groupby(within, observed=True)[dv]
+    ss_betw = ((grp_b.mean(numeric_only=True) - grandmean) ** 2 * grp_b.count()).sum()
+    ss_with = ((grp_w.mean(numeric_only=True) - grandmean) ** 2 * grp_w.count()).sum()
+    grp = long.groupby([between, within], observed=True)[dv]
+    ss_resall = ((long[dv] - grp.transform("mean")) ** 2).sum()
+    ss_total = ((long[dv] - grandmean) ** 2).sum()
+    ss_inter = ss_total - (ss_resall + ss_with + ss_betw)
+    ss_subj = n_rm * ((data_piv.mean(axis=1) - grandmean) ** 2).sum()
+    ss_resbetw = ss_subj - ss_betw
+    ss_reswith = ss_total - (ss_with + ss_subj + ss_inter)
+    df_resbetw = n_subj - n_groups
+    df_reswith = (n_rm - 1) * df_resbetw
+    return (
+        ss_resbetw / df_resbetw,
+        df_resbetw,
+        ss_reswith / df_reswith,
+        df_reswith,
+        n_rm,
+    )
+
+
+def _pooled_mixed(
+    data_piv, long, dv, within, between, within_first,
+    effsize, alternative, return_desc,
+):
+    """Pooled comparisons for a mixed (one within x one between) design.
+
+    The within-subject main effect and the interaction use the within-subject error term of
+    :py:func:`pingouin.mixed_anova` (subject x within interaction), while the between-subject main
+    effect uses the between-subject error term (subjects nested in groups). When the interaction
+    compares the between-subject groups at each level of the within factor
+    (``within_first=True``), the standard error of the cell-mean difference combines both error
+    mean squares and its degrees of freedom use a Welch-Satterthwaite approximation.
+    """
+    ms_b, df_b, ms_w, df_w, n_rm = _mixed_error_terms(data_piv, long, dv, within, between)
+    groups_w = _group_arrays(long, within, dv)
+    groups_both = _group_arrays(long, [between, within], dv)
+    n_subj = data_piv.shape[0]
+    within_rows = []
+    between_rows = []
+
+    # Within-subject main effect: marginal means across all the subjects, within-subject error
+    w_means = long.groupby(within, observed=True, sort=True)[dv].mean()
+    for a, b in combinations(w_means.index, 2):
+        x, y = groups_w[a], groups_w[b]
+        se = np.sqrt(2 * ms_w / n_subj)
+        desc = (
+            (w_means[a], np.nanstd(x, ddof=1), w_means[b], np.nanstd(y, ddof=1))
+            if return_desc
+            else None
+        )
+        row = {"Contrast": within, "A": a, "B": b, "Paired": True}
+        row.update(
+            _pooled_row(w_means[a] - w_means[b], se, df_w, alternative, True, x, y, effsize, desc)
+        )
+        within_rows.append(row)
+
+    # Between-subject main effect: one mean per subject, between-subject error term.
+    # var(subject mean) = (MS_between_error + (k - 1) * MS_within_error) / k = MS_b / k, so the
+    # SE uses MS_b / k.
+    subj_mean = data_piv.mean(axis=1)
+    b_means = subj_mean.groupby(level=between, observed=True, sort=True).mean()
+    b_n = subj_mean.groupby(level=between, observed=True, sort=True).count()
+    groups_b = _group_arrays(
+        data_piv.mean(axis=1).rename(dv).reset_index(), between, dv
+    )
+    for a, b in combinations(b_means.index, 2):
+        x, y = groups_b[a], groups_b[b]
+        se = np.sqrt((ms_b / n_rm) * (1 / b_n[a] + 1 / b_n[b]))
+        desc = (
+            (b_means[a], np.nanstd(x, ddof=1), b_means[b], np.nanstd(y, ddof=1))
+            if return_desc
+            else None
+        )
+        row = {"Contrast": between, "A": a, "B": b, "Paired": False}
+        row.update(
+            _pooled_row(b_means[a] - b_means[b], se, df_b, alternative, False, x, y, effsize, desc)
+        )
+        between_rows.append(row)
+
+    # The main effects follow the factor order: within first by default, between first otherwise.
+    rows = within_rows + between_rows if within_first else between_rows + within_rows
+
+    # Interaction
+    cell_grp = long.groupby([between, within], observed=True, sort=True)[dv]
+    cell_mean = cell_grp.mean()
+    cell_n = cell_grp.count()
+    if not within_first:
+        # Within each group, compare the levels of the within factor: within-subject error.
+        # Group labels follow the alphabetical (groupby) ordering, not their order of appearance
+        # in the wide-format table.
+        contrast = f"{between} * {within}"
+        for grp in long.groupby(between, observed=True, sort=True).groups.keys():
+            sub = data_piv.xs(grp, level=between)
+            n_g = sub.shape[0]
+            means = sub.mean(axis=0)
+            for a, b in combinations(data_piv.columns, 2):
+                x, y = groups_both[(grp, a)], groups_both[(grp, b)]
+                se = np.sqrt(2 * ms_w / n_g)
+                desc = (
+                    (means[a], np.nanstd(x, ddof=1), means[b], np.nanstd(y, ddof=1))
+                    if return_desc
+                    else None
+                )
+                row = {
+                    "Contrast": contrast,
+                    "Time": grp,
+                    "A": a,
+                    "B": b,
+                    "Paired": True,
+                }
+                row.update(
+                    _pooled_row(
+                        means[a] - means[b], se, df_w, alternative, True, x, y, effsize, desc
+                    )
+                )
+                rows.append(row)
+    else:
+        # At each level of the within factor, compare the groups: cell means. Under the
+        # split-plot model Y_sj = fixed effects + u_s + e_sj, the between-subject error MS on
+        # the subject-mean scale is MS_b / k (so that E(MS_b / k) = sigma_u^2 + sigma_e^2 / k)
+        # and E(MS_w) = sigma_e^2. The unbiased estimate of the variance of a cell mean over n
+        # subjects is (MS_b / k) / n + MS_w * (k - 1) / (k n); the variance of the difference is
+        # the sum of the two cell estimates. The degrees of freedom combine the two independent
+        # mean squares with the Welch-Satterthwaite equation.
+        ms_b_mean = ms_b / n_rm
+        contrast = f"{within} * {between}"
+        for tlevel in data_piv.columns:
+            means = cell_mean.xs(tlevel, level=within)
+            ns = cell_n.xs(tlevel, level=within)
+            for a, b in combinations(means.index, 2):
+                c1_a, c2_a = 1 / ns[a], (n_rm - 1) / (n_rm * ns[a])
+                c1_b, c2_b = 1 / ns[b], (n_rm - 1) / (n_rm * ns[b])
+                v_a = c1_a * ms_b_mean + c2_a * ms_w
+                v_b = c1_b * ms_b_mean + c2_b * ms_w
+                v = v_a + v_b
+                se = np.sqrt(v)
+                dof = v**2 / (
+                    (c1_a + c1_b) ** 2 * ms_b_mean**2 / df_b
+                    + (c2_a + c2_b) ** 2 * ms_w**2 / df_w
+                )
+                x, y = groups_both[(a, tlevel)], groups_both[(b, tlevel)]
+                desc = (
+                    (means[a], np.nanstd(x, ddof=1), means[b], np.nanstd(y, ddof=1))
+                    if return_desc
+                    else None
+                )
+                row = {
+                    "Contrast": contrast,
+                    "Time": tlevel,
+                    "A": a,
+                    "B": b,
+                    "Paired": False,
+                }
+                row.update(
+                    _pooled_row(
+                        means[a] - means[b], se, dof, alternative, False, x, y, effsize, desc
+                    )
+                )
+                rows.append(row)
+    return rows
+
+
+def _pooled_pairwise_tests(
+    data, data_piv, dv, between, within, subject, contrast, factors,
+    interaction, within_first, alternative, padjust, alpha, effsize, return_desc,
+):
+    """Run all the pooled pairwise tests, one family of contrasts per effect, and assemble them.
+
+    Each contrast (factor main effect or interaction) is adjusted for multiple comparisons on its
+    own, following the same family grouping as the non-pooled :py:func:`pairwise_tests`.
+    """
+    if contrast == "simple_between":
+        rows = _pooled_simple_between(data, dv, between, effsize, alternative, return_desc)
+        interaction_name = None
+    elif contrast == "multiple_between":
+        rows = _pooled_multiple_between(data, dv, factors, effsize, alternative, return_desc)
+        interaction_name = f"{factors[0]} * {factors[1]}"
+    elif contrast == "simple_within":
+        rows = _pooled_simple_within(data_piv, dv, within, effsize, alternative, return_desc)
+        interaction_name = None
+    else:
+        rows = _pooled_mixed(
+            data_piv, data, dv, within, between, within_first,
+            effsize, alternative, return_desc,
+        )
+        interaction_name = f"{within} * {between}" if within_first else f"{between} * {within}"
+
+    if not interaction and interaction_name is not None:
+        rows = [row for row in rows if row["Contrast"] != interaction_name]
+
+    stats = []
+    for name in dict.fromkeys(row["Contrast"] for row in rows):
+        family = pd.DataFrame([row for row in rows if row["Contrast"] == name])
+        stats.append(_padjust(family, padjust=padjust, alpha=alpha))
+
+    stats = pd.concat(stats, axis=0, ignore_index=True, sort=False)
+    stats["Parametric"] = True
+    return stats
+
+
 @pf.register_dataframe_method
 def pairwise_ttests(*args, **kwargs):
     """This function has been deprecated . Use :py:func:`pingouin.pairwise_tests` instead."""
@@ -110,6 +505,7 @@ def pairwise_tests(
     return_desc=False,
     interaction=True,
     within_first=True,
+    pooled=False,
 ):
     """Pairwise tests.
 
@@ -197,6 +593,43 @@ def pairwise_tests(
         and between * within otherwise.
 
         .. versionadded:: 0.3.6
+    pooled : boolean
+        If True, the parametric pairwise tests use the pooled error term of the corresponding
+        ANOVA instead of estimating the variance separately from the two groups (or conditions)
+        of each comparison. This makes the post-hoc tests consistent with the omnibus test: the
+        T statistics are contrasts divided by an ANOVA-based standard error, and the degrees of
+        freedom are those of the ANOVA error term. Only parametric tests are supported. A ``se``
+        column with the standard error is added to the output, and no Bayes Factor is computed.
+
+        The error term depends on the design:
+
+        * **One between-subject factor**: the Within mean square of the one-way
+          :py:func:`anova`, with ``N - k`` degrees of freedom. The standard errors are the
+          Tukey-Kramer standard errors, so the T-values are identical to
+          :py:func:`pairwise_tukey`.
+        * **Two between-subject factors**: the residual mean square of the full factorial model
+          (with the interaction), with ``N - number of cells`` degrees of freedom. The main
+          effects compare estimated marginal means, i.e. the cell means averaged with equal
+          weights across the levels of the other factor. When a factor has only two levels, the
+          squared T of its contrast equals the F statistic of that factor in
+          :py:func:`anova` (``ss_type=3``). The interaction contrasts compare cell means and
+          have the same T-values as :py:func:`pairwise_tukey`.
+        * **One within-subject factor**: the subject x condition mean square of
+          :py:func:`rm_anova`, with ``(n - 1)(k - 1)`` degrees of freedom. With two levels the
+          T and p-values are identical to the regular paired T-test.
+        * **Mixed design (one within x one between)**: the within-subject main effect and the
+          interaction use the within-subject error term of :py:func:`mixed_anova` (its ``DF2``),
+          while the between-subject main effect, computed on each subject's mean, uses the
+          between-subject error term (its ``DF2``). When the interaction compares the
+          between-subject groups at each level of the within factor
+          (``within_first=True``), the standard error combines both error mean squares of the
+          split-plot model and its degrees of freedom follow a Welch-Satterthwaite
+          approximation (they may be non-integer).
+
+        Two within-subject factors are not supported. With two between-subject factors, all the
+        cells (combinations of factor levels) must contain at least one observation.
+
+        .. versionadded:: 0.7.1
 
     Returns
     -------
@@ -213,11 +646,12 @@ def pairwise_tests(
           data)
         * ``'W_val'``: Wilcoxon W stat (if parametric=False and paired data)
         * ``'dof'``: degrees of freedom (only if parametric=True)
+        * ``'se'``: standard error of the estimated difference (only if ``pooled=True``)
         * ``'alternative'``: tail of the test
         * ``'p_unc'``: Uncorrected p-values
         * ``'p_corr'``: Corrected p-values
         * ``'p_adjust'``: p-values correction method
-        * ``'BF10'``: Bayes Factor
+        * ``'BF10'``: Bayes Factor (not computed when ``pooled=True``)
         * ``'hedges'``: effect size (or any effect size defined in
           ``effsize``)
 
@@ -332,6 +766,13 @@ def pairwise_tests(
     1     Time   August     January   False        True -1.806  118.0        less  0.037  -0.328
     2     Time   August        June   False        True -2.660  118.0        less  0.004  -0.483
     3     Time  January        June   False        True -0.934  118.0        less  0.176  -0.170
+
+    7. Pooled error term, consistent with the omnibus ANOVA. The standard error (``se``) is
+    reported but no Bayes Factor is computed.
+
+    >>> pg.pairwise_tests(dv="Scores", between="Group", data=df, pooled=True).round(3)
+      Contrast        A           B  Paired  Parametric     T    dof     se alternative  p_unc  hedges
+    0    Group  Control  Meditation   False        True -2.29  178.0  0.152   two-sided  0.023  -0.34
     """
     # Safety checks
     data = _check_dataframe(
@@ -340,6 +781,16 @@ def pairwise_tests(
     _check_alternative(alternative)
     assert isinstance(alpha, float), "alpha must be float."
     assert nan_policy in ["listwise", "pairwise"]
+    if not isinstance(pooled, bool):
+        raise ValueError("pooled must be a boolean.")
+    if pooled:
+        if not parametric:
+            raise ValueError("Pooled pairwise tests are only available for parametric tests.")
+        if nan_policy == "pairwise":
+            raise ValueError(
+                "Pooled pairwise tests require listwise deletion of missing values "
+                "(nan_policy='listwise')."
+            )
 
     # Check if we have multiple between or within factors
     for name, factor in [("between", between), ("within", within)]:
@@ -376,7 +827,19 @@ def pairwise_tests(
         contrast = "within_between"
         assert between in data.keys() and within in data.keys()
 
-    # Create col_order
+    if pooled:
+        if contrast == "multiple_within":
+            raise ValueError(
+                "Pooled pairwise tests are not supported for two within-subject factors."
+            )
+        if contrast == "within_between" and not marginal:
+            raise ValueError(
+                "Pooled pairwise tests in a mixed design require marginal=True for the "
+                "between-subject factor."
+            )
+
+    # Create col_order. The standard error is only reported for pooled parametric tests, and the
+    # Bayes Factor is not computed in that case.
     col_order = [
         "Contrast",
         "Time",
@@ -392,6 +855,7 @@ def pairwise_tests(
         "U_val",
         "W_val",
         "dof",
+        "se",
         "alternative",
         "p_unc",
         "p_corr",
@@ -399,6 +863,8 @@ def pairwise_tests(
         "BF10",
         effsize,
     ]
+    if pooled:
+        col_order.remove("BF10")
 
     # If repeated measures, pivot and stack the table. This has several effects:
     # 1) Force missing values to be explicit (a NaN cell is created)
@@ -415,6 +881,46 @@ def pairwise_tests(
         # Stack instead of melt, which fails when a level of the within factor(s) is named as dv
         data = data_piv.stack(list(range(data_piv.columns.nlevels)), future_stack=True)
         data = data.rename(dv).reset_index()
+    else:
+        data_piv = None
+
+    if pooled:
+        # Pooled error terms: each contrast uses the error term of the matching ANOVA, so the
+        # post-hoc T statistics are consistent with the omnibus F tests.
+        if contrast in ("simple_between", "multiple_between"):
+            factors = [between] if contrast == "simple_between" else between
+        elif contrast == "simple_within":
+            factors = [within]
+        else:
+            factors = [within, between] if within_first else [between, within]
+        with _no_rounding():  # For max precision
+            stats = _pooled_pairwise_tests(
+                data=data,
+                data_piv=data_piv,
+                dv=dv,
+                between=between,
+                within=within,
+                subject=subject,
+                contrast=contrast,
+                factors=factors,
+                interaction=interaction,
+                within_first=within_first,
+                alternative=alternative,
+                padjust=padjust,
+                alpha=alpha,
+                effsize=effsize,
+                return_desc=return_desc,
+            )
+        # Reorder and drop empty columns
+        stats = stats[[c for c in col_order if c in stats.columns]]
+        stats = stats.dropna(how="all", axis=1)
+
+        # Rename Time columns
+        if "Time" in stats.columns:
+            stats["Time"] = stats["Time"].fillna("-")
+            stats = stats.rename(columns={"Time": factors[0]})
+
+        return _postprocess_dataframe(stats)
 
     # Define the main effects, as (factor, paired, marginal) tuples, and the interaction.
     # Within-subject factors are always tested on the marginal means of each subject, i.e. after
@@ -430,7 +936,6 @@ def pairwise_tests(
         main_effects = [(within, True, False)]
     elif contrast == "multiple_between":
         # BETWEEN1 + BETWEEN2 + BETWEEN1 * BETWEEN2
-        # TODO: add a pool SD option, as in JASP and JAMOVI?
         factors = between
         main_effects = [(f, False, False) for f in factors]
         paired_interaction = False
